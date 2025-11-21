@@ -1,0 +1,92 @@
+Node Operator Manager Can Erase All Past And Future Fees Via Self-Exemption
+
+Brief / Intro
+
+The NodeOperatorFee contract allows the node-operator manager to unilaterally wipe out all past and future fees for a vault by abusing the addFeeExemption mechanism.
+
+Because the manager role administers the exemption role and addFeeExemption directly increments settledGrowth with no confirmations or deposit linkage, a single manager can:
+1. self-grant NODE_OPERATOR_FEE_EXEMPT_ROLE,
+2. call addFeeExemption(Y) for any arbitrary amount Y,
+3. push settledGrowth up to the current growth so accruedFee() instantly returns zero, and
+4. repeat that after every report to permanently suppress fee accrual.
+
+This completely disables the fee model for that vault and creates an unlimited “erase fees” lever in the hands of the party that is supposed to pay those fees. It is an economic/financial attack that deprives the treasury and stakers of protocol revenue.
+
+Affected Components
+
+• `src/contracts/0.8.25/vaults/dashboard/NodeOperatorFee.sol`
+  - `_initialize` role setup and admin wiring (`lines 108-138`)
+  - `_collectAndCheckConfirmations`-guarded functions (`lines 204-270`)
+  - `addFeeExemption` / `_addFeeExemption` touching `settledGrowth` without guards (`lines 247-334`)
+
+• `test/NodeOperatorFeePoC.t.sol`
+  - `NodeOperatorFeePoCTest.setUp()` deploying a NodeOperatorFee clone (`lines 40-87`)
+  - `testNodeOperatorCanEraseFeesViaSelfExemption()` performing the base exploit (`lines 59-80`)
+  - `DashboardFactoryLikePoCTest.setUp()` cloning the actual Dashboard implementation with mocks (`lines 90-123`)
+  - `testManagerKeepsFeesZeroViaDashboard()` repeating the attack through the dashboard UX (`lines 124-144`)
+
+Root Cause
+
+1. Role structure gives the manager unilateral control over exemptions.
+   - `_initialize` (`NodeOperatorFee.sol:108-138`) grants `NODE_OPERATOR_MANAGER_ROLE` and immediately sets it as the admin for `NODE_OPERATOR_FEE_EXEMPT_ROLE`, so the manager can self-grant exemptions without any second signer.
+
+2. `addFeeExemption` mutates `settledGrowth` with zero guardrails.
+   - `addFeeExemption(uint256)` (`lines 247-255`) is only guarded by the exemption role; `_addFeeExemption` (`lines 315-324`) simply adds `_amount` (capped at `type(uint104).max`) to `settledGrowth` and updates `latestCorrectionTimestamp`. There is no linkage to actual deposits, no oracle freshness requirement, and no dual confirmation.
+
+3. Other fee-critical mutations are strongly gated, so this bypass undermines the design intent.
+   - `setFeeRate`, `correctSettledGrowth`, and `setConfirmExpiry` ( `NodeOperatorFee.sol:204-270` ) all run `_collectAndCheckConfirmations`, require fresh non-quarantined reports, and forbid corrections after oracle timestamps. `addFeeExemption` touches the same `settledGrowth` variable but skips every guardrail, enabling retroactive and prospective fee erasure.
+
+Technical Details
+
+Fee model recap:
+• currentGrowth = totalValue – inOutDelta (from VaultHub report)
+• settledGrowth tracks the portion considered paid/exempt
+• accruedFee() = max(0, currentGrowth – settledGrowth) * feeRate / 10_000
+
+Under normal conditions, settledGrowth only increases when fees are disbursed or governance-corrected with dual confirmation. addFeeExemption bypasses this by pretending an arbitrary amount has already been accounted for.
+
+How the manager erases fees:
+• Self-grant the exemption role via grantRole(NODE_OPERATOR_FEE_EXEMPT_ROLE, manager)
+• Call addFeeExemption(Y) where Y equals the current growth
+• settledGrowth jumps to currentGrowth, accruedFee() drops to zero, wiping existing dues
+• Repeat each period to prevent future accrual; the only bound is Y <= type(uint104).max (~2e31 wei), so the amount is effectively unbounded.
+
+Proof of Concept
+
+File: `test/NodeOperatorFeePoC.t.sol`
+• `NodeOperatorFeePoCTest.setUp()` (`lines 40-87`) deploys a `NodeOperatorFee` clone using `Clones.cloneWithImmutableArgs`, configures a mock report with `totalValue = 200 ether`, `inOutDelta = 100 ether`, and initializes the dashboard with `MANAGER` as `NODE_OPERATOR_MANAGER_ROLE`.
+• `testNodeOperatorCanEraseFeesViaSelfExemption()` (`lines 59-80`) asserts `accruedFee() > 0`, then has `MANAGER` self-grant the exemption role and call `addFeeExemption(100 ether)`. After the call, `accruedFee() == 0` and `settledGrowth == 100 ether`.
+• `DashboardFactoryLikePoCTest.setUp()` (`lines 90-123`) mirrors the factory path by cloning the real `Dashboard` implementation (with mock stETH/wstETH, VaultHub, and LazyOracle) to show the attack through the UX that operators actually use.
+• `testManagerKeepsFeesZeroViaDashboard()` (`lines 124-144`) performs two consecutive exemptions: the manager erases the first 10 ETH of fees, then updates the report to show new growth and erases the next 6 ETH. Fees stay at zero before and after both reports, proving the attack can be repeated indefinitely.
+
+How to run
+
+```
+forge test -vv --match-test testNodeOperatorCanEraseFeesViaSelfExemption
+forge test -vv --match-test testManagerKeepsFeesZeroViaDashboard
+```
+
+Both tests should pass. The second one’s trace shows the realistic dashboard deployment, self-grant of `NODE_OPERATOR_FEE_EXEMPT_ROLE`, and the double exemption across successive oracle reports.
+
+Impact Quantification
+
+• Immediate loss: for growth Y and fee rate R, the expected fee is R·Y. The PoC shows Y = 100 ETH, R = 10%, so 10 ETH disappears instantly.
+• Persistent loss: by repeating the exemption after every oracle report, the manager can force accruedFee() to stay at zero indefinitely, eliminating all future revenue from that vault. For Y = 1000 ETH/month at R = 5%, that is 50 ETH/month (600 ETH/year) per vault.
+• Because _amount can be massive (capped only by type(uint104).max), the attack can erase millions of dollars in fees without any on-chain justification.
+
+Why this violates design intent
+
+If total fee control were meant to reside in the manager’s hands, the contract would not force dual confirmations, fresh-report checks, and quarantine checks on functions like setFeeRate and correctSettledGrowth. Those guardrails exist precisely to stop unilateral resets. addFeeExemption bypasses them yet accomplishes the same economic effect, proving it is a design bug rather than an intended power.
+
+Severity
+
+High – economic/financial attack: the node operator manager can deterministically prevent any fee revenue from their vault. This undermines the protocol’s revenue model and could result in large losses to the treasury and stETH holders.
+
+Recommended Fixes
+
+1. Apply the same confirmation path to addFeeExemption as to setFeeRate/correctSettledGrowth so a manager cannot act alone.
+2. Tie exemptions to verifiable deposits (PDG proofs, unguaranteed deposits) with hard caps and accounting.
+3. Enforce invariants such as settledGrowth <= currentGrowth + epsilon to block arbitrary jumps.
+4. If an emergency exemption path is required, restrict it to governance/admin roles and document it explicitly.
+
+With these mitigations, the fee model regains its intended protections, and managers can no longer erase fees unilaterally.
